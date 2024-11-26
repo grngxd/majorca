@@ -33,9 +33,9 @@ type BaseBrowser struct {
 	sync.Mutex
 	Path     string
 	Cmd      *exec.Cmd
-	Ws       interface{} // WebSocket connection, type depends on the browser
+	Ws       *websocket.Conn // Changed from *websocket.Conn (gorilla) to *websocket.Conn (golang/x/net)
 	Id       int32
-	Pending  map[int32]chan Result
+	Pending  map[string]chan interface{}
 	Bindings map[string]BindingFunc
 	Done     chan struct{}  // Channel to signal goroutine to stop
 	Wg       sync.WaitGroup // WaitGroup to wait for goroutines to finish
@@ -72,11 +72,8 @@ func (b *BaseBrowser) Kill() error {
 
 	if b.Ws != nil {
 		// Close WebSocket connection if applicable
-		switch ws := b.Ws.(type) {
-		case *websocket.Conn:
-			if err := ws.Close(); err != nil {
-				fmt.Printf("Error closing WebSocket: %v\n", err)
-			}
+		if err := b.Ws.Close(); err != nil {
+			fmt.Printf("Error closing WebSocket: %v\n", err)
 		}
 	}
 
@@ -107,13 +104,23 @@ func (b *BaseBrowser) Load(url string) error {
 	return fmt.Errorf("Load not implemented")
 }
 
+func (b *BaseBrowser) Bind(name string, f BindingFunc) error {
+	b.Lock()
+	defer b.Unlock()
+	if _, exists := b.Bindings[name]; exists {
+		return fmt.Errorf("binding %s already exists", name)
+	}
+	b.Bindings[name] = f
+	return nil
+}
+
 // isProcessRunning checks if a process with the given PID is still running.
 func isProcessRunning(pid int) bool {
 	process, err := os.FindProcess(pid)
 	if err != nil {
 		return false
 	}
-	// On Windows, sending signal 0 doesn't work as expected, so we attempt to call Kill with 0.
+	// On Windows, sending signal os.Kill doesn't work as expected, so we attempt to call Kill with os.Kill.
 	err = process.Signal(os.Kill)
 	if err != nil {
 		return false

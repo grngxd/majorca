@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/grngxd/majorca/browser"
@@ -17,6 +18,8 @@ import (
 
 type Chrome struct {
 	browser.BaseBrowser
+	Id int32
+	mu sync.Mutex
 }
 
 func New(args ...string) (*Chrome, error) {
@@ -28,11 +31,12 @@ func New(args ...string) (*Chrome, error) {
 
 	chrome := &Chrome{
 		BaseBrowser: browser.BaseBrowser{
-			Pending:  make(map[int32]chan browser.Result),
+			Pending:  make(map[string]chan interface{}),
 			Bindings: make(map[string]browser.BindingFunc),
 			Path:     path,
 			Done:     make(chan struct{}), // Initialize done channel
 		},
+		Id: 1, // Initialize Chrome-specific ID counter
 	}
 
 	// Add necessary flags
@@ -47,8 +51,8 @@ func New(args ...string) (*Chrome, error) {
 		"--disable-infobars",
 		"--disable-session-crashed-bubble",
 		"--disable-features=TranslateUI",
-		"--app=data:text/html,<!DOCTYPE html><html><head><title>about:blank</title></head><body></body></html>",
 		"--disable-features=HoverCard",
+		"--app=data:text/html,<!DOCTYPE html><html><head><title>about:blank</title></head><body></body></html>",
 	)
 
 	chrome.Cmd = exec.Command(path, args...)
@@ -149,15 +153,16 @@ func (c *Chrome) handleResponse() {
 			return
 		default:
 			var res browser.Result
-			if err := websocket.JSON.Receive(c.Ws.(*websocket.Conn), &res); err != nil {
+			if err := websocket.JSON.Receive(c.Ws, &res); err != nil {
 				fmt.Printf("Error receiving response: %v\n", err)
 				continue
 			}
 
+			idStr := fmt.Sprintf("%d", res.ID)
 			c.Lock()
-			if ch, ok := c.Pending[res.ID]; ok {
+			if ch, ok := c.Pending[idStr]; ok {
 				ch <- res
-				delete(c.Pending, res.ID)
+				delete(c.Pending, idStr)
 			}
 			c.Unlock()
 		}
@@ -181,12 +186,32 @@ func (c *Chrome) Load(url string) error {
 		},
 	}
 
+	idStr := fmt.Sprintf("%d", c.Id)
+	responseChan := make(chan interface{})
+	c.Pending[idStr] = responseChan
 	c.Id++
+
 	fmt.Printf("Sending message: %v\n", message)
-	if err := websocket.JSON.Send(c.Ws.(*websocket.Conn), message); err != nil {
+	if err := websocket.JSON.Send(c.Ws, message); err != nil {
+		delete(c.Pending, idStr)
 		return fmt.Errorf("failed to send WebSocket message: %w", err)
 	}
 	fmt.Println("Page.navigate message sent")
+
+	fmt.Println("Waiting for response")
+	resInterface := <-responseChan
+	fmt.Printf("Received response: %v\n", resInterface)
+
+	// Type assert the interface{} to browser.Result
+	res, ok := resInterface.(browser.Result)
+	if !ok {
+		return fmt.Errorf("unexpected response type")
+	}
+
+	if res.Error != nil {
+		return fmt.Errorf("navigation error: %s", res.Error.Message)
+	}
+
 	return nil
 }
 
@@ -206,13 +231,14 @@ func (c *Chrome) Eval(expr string) (string, string, error) {
 		},
 	}
 
-	resultChan := make(chan browser.Result)
-	c.Pending[c.Id] = resultChan
+	idStr := fmt.Sprintf("%d", c.Id)
+	responseChan := make(chan interface{})
+	c.Pending[idStr] = responseChan
 	c.Id++
 
 	fmt.Printf("Sending message: %v\n", message)
-	if err := websocket.JSON.Send(c.Ws.(*websocket.Conn), message); err != nil {
-		delete(c.Pending, c.Id-1)
+	if err := websocket.JSON.Send(c.Ws, message); err != nil {
+		delete(c.Pending, idStr)
 		c.Unlock()
 		return "", "", fmt.Errorf("failed to send WebSocket message: %w", err)
 	}
@@ -220,27 +246,44 @@ func (c *Chrome) Eval(expr string) (string, string, error) {
 	c.Unlock()
 
 	fmt.Println("Waiting for response")
-	res := <-resultChan
+	resInterface := <-responseChan
+	fmt.Printf("Received response: %v\n", resInterface)
+
+	// Type assert the interface{} to browser.Result
+	res, ok := resInterface.(browser.Result)
+	if !ok {
+		return "", "", fmt.Errorf("unexpected response type")
+	}
+
 	if res.Error != nil {
 		return "", "", fmt.Errorf("evaluation error: %s", res.Error.Message)
 	}
 
-	fmt.Printf("Received response: %v\n", res)
-
 	// Define a structure to parse the evaluation result
 	var evalRes struct {
 		Result struct {
-			Type  string `json:"type"`
-			Value string `json:"value"`
+			Type  string      `json:"type"`
+			Value interface{} `json:"value"`
 		} `json:"result"`
 	}
 
-	// Unmarshal the JSON response into the structure
-	if err := json.Unmarshal(res.Result, &evalRes); err != nil {
+	// Marshal and Unmarshal to convert interface{} to JSON
+	resBytes, err := json.Marshal(res.Result)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to marshal response: %w", err)
+	}
+
+	if err := json.Unmarshal(resBytes, &evalRes); err != nil {
 		return "", "", fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
-	return evalRes.Result.Value, evalRes.Result.Type, nil
+	// Handle different types accordingly
+	switch v := evalRes.Result.Value.(type) {
+	case string:
+		return v, evalRes.Result.Type, nil
+	default:
+		return fmt.Sprintf("%v", v), evalRes.Result.Type, nil
+	}
 }
 
 // FindPath locates the Chrome executable path.
